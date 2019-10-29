@@ -8,22 +8,32 @@ package main
 #include "spdk/stdinc.h"
 #include "spdk/env.h"
 #include "spdk/nvme.h"
+#include "spdk/nvme_intel.h"
 
 bool probe_callback(void *cb_ctx,
 	const struct spdk_nvme_transport_id *trid,
 	struct spdk_nvme_ctrlr_opts *opts);
-void attach_callback(void *cb_ctx, 
+void attach_callback(void *cb_ctx,
 	const struct spdk_nvme_transport_id *trid,
 	struct spdk_nvme_ctrlr *ctrlr,
 	const struct spdk_nvme_ctrlr_opts *opts);
+
+bool get_pi_loc(struct spdk_nvme_ns *ns);
 */
 import "C"
 
 import (
 	"fmt"
 	"math"
+	"os"
 	"unsafe"
 )
+
+const ioSizeBytes = 4096
+const queueDepth = 128
+
+var maxMetadataIoSize C.uint32_t = 0
+var maxIoSizeBlocks C.uint32_t = 0
 
 type workerThread struct {
 	namespaceContext *C.struct_ns_worker_ctx
@@ -31,23 +41,19 @@ type workerThread struct {
 	lcore            uint
 }
 
-var g_workers *workerThread
-var g_num_workers = 0
+var workers = make(map[uint]*workerThread)
 
 func registerWorkers() {
 	var i C.uint32_t
-	g_workers = nil
 	for i = C.spdk_env_get_first_core(); i < math.MaxUint32; i = C.spdk_env_get_next_core(i) {
 		worker := &workerThread{}
 		worker.lcore = uint(i)
-		worker.next = g_workers
-		g_workers = worker
-		g_num_workers += 1
+		workers[worker.lcore] = worker
 	}
 }
 
 //export probeCallback
-func probeCallback(callbackContext unsafe.Pointer, 
+func probeCallback(callbackContext unsafe.Pointer,
 	transportID *C.struct_spdk_nvme_transport_id,
 	opts *C.struct_spdk_nvme_ctrlr_opts) bool {
 
@@ -60,16 +66,121 @@ func probeCallback(callbackContext unsafe.Pointer,
 	return true
 }
 
-func registerController(controller *C.struct_spdk_nvme_ctrlr) {
+type namespaceEntry struct {
+	controller         *C.struct_spdk_nvme_ctrlr
+	namespace          *C.struct_spdk_nvme_ns
+	next               *namespaceEntry
+	ioSizeBlocks       C.uint32_t
+	numIoRequests      C.uint32_t
+	sizeInIos          C.uint64_t
+	blockSize          C.uint32_t
+	metadataSize       C.uint32_t
+	metadataInterleave C.bool
+	piLoc              C.bool
+	piType             C.enum_spdk_nvme_pi_type
+	ioFlags            C.uint32_t
+	name               string
+}
 
+var namespaces = make(map[string]*namespaceEntry)
+
+func registerNamespace(controller *C.struct_spdk_nvme_ctrlr,
+	namespace *C.struct_spdk_nvme_ns) {
+
+	if !C.spdk_nvme_ns_is_active(namespace) {
+		fmt.Println("Skipping inactive namespace")
+		return
+	}
+
+	ns_size := C.spdk_nvme_ns_get_size(namespace)
+	sector_size := C.spdk_nvme_ns_get_sector_size(namespace)
+	if ns_size < ioSizeBytes || sector_size > ioSizeBytes {
+		fmt.Println("invalid ns_size/sector_size for IO size")
+		return
+	}
+
+	max_xfer_size := C.spdk_nvme_ns_get_max_io_xfer_size(namespace)
+	ioQpairOpts := &C.struct_spdk_nvme_io_qpair_opts{}
+	C.spdk_nvme_ctrlr_get_default_io_qpair_opts(controller, ioQpairOpts,
+		C.sizeof_struct_spdk_nvme_io_qpair_opts)
+	entryCount := (ioSizeBytes-1)/max_xfer_size + 2
+	if (queueDepth * entryCount) > ioQpairOpts.io_queue_size {
+		fmt.Println("Warn: Consider using lower queue depth or small IO size because " +
+			"IO requests may be queued at the NVMe driver")
+	}
+	entryCount += 1
+
+	entry := &namespaceEntry{
+		controller:         controller,
+		namespace:          namespace,
+		numIoRequests:      queueDepth * entryCount,
+		sizeInIos:          ns_size / ioSizeBytes,
+		ioSizeBlocks:       ioSizeBytes / sector_size,
+		blockSize:          C.spdk_nvme_ns_get_extended_sector_size(namespace),
+		metadataSize:       C.spdk_nvme_ns_get_md_size(namespace),
+		metadataInterleave: C.spdk_nvme_ns_supports_extended_lba(namespace),
+		piLoc:              C.get_pi_loc(namespace), // no way to access bit field, use a polyfill function
+		piType:             C.spdk_nvme_ns_get_pi_type(namespace),
+	}
+	if maxMetadataIoSize < entry.metadataSize {
+		maxMetadataIoSize = entry.metadataSize
+	}
+	if maxIoSizeBlocks < entry.ioSizeBlocks {
+		maxIoSizeBlocks = entry.metadataSize
+	}
+	transportID := C.spdk_nvme_ctrlr_get_transport_id(controller)
+	traddr := C.GoBytes(unsafe.Pointer(&transportID.traddr), 257)
+	entry.name = fmt.Sprintf("PCIE (%s)", string(traddr))
+
+	namespaces[entry.name] = entry
+}
+
+type controllerEntry struct {
+	nvmeController *C.struct_spdk_nvme_ctrlr
+	transportType  C.enum_spdk_nvme_transport_type
+	latencyPage    *C.struct_spdk_nvme_intel_rw_latency_page
+	qPairs         []*C.struct_spdk_nvme_qpair
+	next           *controllerEntry
+	name           string
+}
+
+var controllers = make(map[string]*controllerEntry)
+
+func registerController(controller *C.struct_spdk_nvme_ctrlr) {
+	entry := &controllerEntry{}
+
+	entry.latencyPage = (*C.struct_spdk_nvme_intel_rw_latency_page)(
+		C.spdk_dma_zmalloc(C.sizeof_struct_spdk_nvme_intel_rw_latency_page,
+			4096, nil))
+	if entry.latencyPage == nil {
+		fmt.Println("Allocation error (latency page)")
+		os.Exit(1)
+	}
+
+	transportID := C.spdk_nvme_ctrlr_get_transport_id(controller)
+	traddr := C.GoBytes(unsafe.Pointer(&transportID.traddr), 257)
+	entry.name = fmt.Sprintf("PCIE (%s)", string(traddr))
+	controllers[entry.name] = entry
+
+	entry.nvmeController = controller
+	entry.transportType = 256 // PCIE
+
+	var namespaceID C.uint32_t
+	for namespaceID = C.spdk_nvme_ctrlr_get_first_active_ns(controller); namespaceID != 0; namespaceID = C.spdk_nvme_ctrlr_get_next_active_ns(controller, namespaceID) {
+		namespace := C.spdk_nvme_ctrlr_get_ns(controller, namespaceID)
+		if namespace == nil {
+			continue
+		}
+		registerNamespace(controller, namespace)
+	}
 }
 
 //export attachCallback
-func attachCallback(callbackContext unsafe.Pointer, 
+func attachCallback(callbackContext unsafe.Pointer,
 	transportID *C.struct_spdk_nvme_transport_id,
 	controller *C.struct_spdk_nvme_ctrlr, opts *C.struct_spdk_nvme_ctrlr_opts) {
 
-	pci_addr := &C.struct_spdk_pci_addr{};
+	pci_addr := &C.struct_spdk_pci_addr{}
 	returnValue, _ := C.spdk_pci_addr_parse(pci_addr, &transportID.traddr[0])
 	if returnValue != 0 {
 		fmt.Println("spdk_pci_addr_parse error")
@@ -85,16 +196,77 @@ func attachCallback(callbackContext unsafe.Pointer,
 	traddr := C.GoBytes(unsafe.Pointer(&transportID.traddr), 257)
 	fmt.Printf("Attached to NVMe controller at %s [%04x:%04x]\n",
 		string(traddr), pci_id.vendor_id, pci_id.device_id)
+
+	registerController(controller)
 }
 
 func registerConterollers() int {
 	fmt.Println("Initializing NVMe Controllers")
 	returnValue, _ := C.spdk_nvme_probe(nil, nil,
-		C.spdk_nvme_probe_cb(C.probe_callback), 
+		C.spdk_nvme_probe_cb(C.probe_callback),
 		C.spdk_nvme_attach_cb(C.attach_callback), nil)
 	if returnValue != 0 {
 		fmt.Println("spdk_nvme_probe failed")
 		return -1
+	}
+	return 0
+}
+
+type namespaceWorkerContext struct {
+	worker    *workerThread
+	namespace *namespaceEntry
+	queuePair *C.struct_spdk_nvme_qpair
+}
+
+// we only support one core - namespace association
+var associateContext namespaceWorkerContext
+
+func associateWorkersWithNamespace() {
+	if len(workers) != 1 || len(namespaces) != 1 {
+		fmt.Println("unhandled case for go-spdk-perf")
+		os.Exit(-1)
+	}
+	for lcore, worker := range workers {
+		for name, space := range namespaces {
+			fmt.Printf("Associating %s with lcore %d\n", name, lcore)
+			associateContext = namespaceWorkerContext{
+				worker:    worker,
+				namespace: space,
+			}
+			return
+		}
+	}
+}
+
+func nvmeInitNamespaceWorkerContext() int {
+	associateContext.queuePair = &C.struct_spdk_nvme_qpair{}
+	qPairOptions := C.struct_spdk_nvme_io_qpair_opts{}
+
+	C.spdk_nvme_ctrlr_get_default_io_qpair_opts(associateContext.namespace.controller,
+		&qPairOptions,
+		C.sizeof_struct_spdk_nvme_io_qpair_opts)
+	if qPairOptions.io_queue_requests < associateContext.namespace.numIoRequests {
+		qPairOptions.io_queue_requests = associateContext.namespace.numIoRequests
+	}
+	qPairOptions.delay_pcie_doorbell = true
+
+	associateContext.queuePair = C.spdk_nvme_ctrlr_alloc_io_qpair(
+		associateContext.namespace.controller,
+		&qPairOptions,
+		C.sizeof_struct_spdk_nvme_io_qpair_opts)
+	if associateContext.queuePair == nil {
+		fmt.Println("ERROR: spdk_nvme_ctrlr_alloc_io_qpair failed")
+		return -1
+	}
+	return 0
+}
+
+func workerFunction(worker *workerThread) int {
+	fmt.Println("Starting thread on core", worker.lcore)
+	v := nvmeInitNamespaceWorkerContext()
+	if v != 0 {
+		fmt.Println("ERROR: init_ns_worker_ctx() failed")
+		return 1
 	}
 	return 0
 }
@@ -116,5 +288,42 @@ func main() {
 	registerWorkers()
 
 	registerConterollers()
+
+	fmt.Println("workers:", workers)
+	fmt.Println("controllers:", controllers)
+	fmt.Println("namespaces:", namespaces)
+
+	if len(namespaces) == 0 {
+		fmt.Println("No valid NVMe controllers found")
+		return
+	}
+
+	associateWorkersWithNamespace()
+
+	fmt.Println("Initialization complete. Launching workers.")
+
+	masterCore := C.spdk_env_get_current_core()
+	var masterWorker *workerThread
+	for lcore, worker := range workers {
+		if lcore != uint(masterCore) {
+			fmt.Println("lcore != masterCore", lcore, masterCore)
+		} else {
+			masterWorker = worker
+		}
+	}
+	if masterWorker == nil {
+		fmt.Println("master worker is nil")
+		return
+	}
+
+	rc := workerFunction(masterWorker)
+
+	C.spdk_env_thread_wait_all()
+
+	printStats()
+	os.Exit(rc)
+}
+
+func printStats() {
 
 }

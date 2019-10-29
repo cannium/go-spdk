@@ -14,7 +14,7 @@ bool probe_callback(void *cb_ctx,
     return probeCallback(cb_ctx, trid, opts);
 }
 
-void attach_callback(void *cb_ctx, 
+void attach_callback(void *cb_ctx,
 	const struct spdk_nvme_transport_id *trid,
 	struct spdk_nvme_ctrlr *ctrlr,
 	const struct spdk_nvme_ctrlr_opts *opts) {
