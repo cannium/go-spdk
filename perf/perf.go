@@ -271,15 +271,20 @@ func nvmeInitNamespaceWorkerContext() int {
 }
 
 type perfTask struct {
+	id        int
 	ioVector  C.struct_iovec
 	submitTsc C.uint64_t
+	maxTsc    C.uint64_t
+	minTsc    C.uint64_t
 	isRead    bool
 	context   *namespaceWorkerContext
 }
 
-func allocateTask(payloadPattern int) perfTask {
+func allocateTask(taskID int) perfTask {
 	task := perfTask{
+		id:      taskID,
 		context: &associateContext,
+		minTsc:  math.MaxUint64,
 	}
 	task.ioVector.iov_base = C.spdk_dma_zmalloc(ioSizeBytes, ioAlign, nil)
 	if task.ioVector.iov_base == nil {
@@ -287,17 +292,24 @@ func allocateTask(payloadPattern int) perfTask {
 		os.Exit(1)
 	}
 	task.ioVector.iov_len = ioSizeBytes
-	pattern := payloadPattern%8 + 1
+	pattern := taskID%8 + 1
 	C.memory_set(task.ioVector.iov_base, C.int(pattern), ioSizeBytes)
 	return task
 }
 
 //export ioCompleteCallback
-func ioCompleteCallback(callbackContext unsafe.Pointer,
-	complete *C.struct_spdk_nvme_cpl) {
+func ioCompleteCallback(taskID C.int, complete *C.struct_spdk_nvme_cpl) {
 
 	if C.complete_is_error(complete) {
 		fmt.Println("IO error")
+	}
+	task := tasks[taskID]
+	timeDiff := C.spdk_get_ticks() - task.submitTsc
+	if timeDiff > task.maxTsc {
+		task.maxTsc = timeDiff
+	}
+	if timeDiff < task.minTsc {
+		task.minTsc = timeDiff
 	}
 
 	associateContext.currentQueueDepth -= 1
@@ -305,7 +317,6 @@ func ioCompleteCallback(callbackContext unsafe.Pointer,
 	if associateContext.isDraining {
 		return
 	}
-	task := tasks[rand.Int()%len(tasks)]
 	submitTask(task)
 }
 
@@ -314,7 +325,7 @@ func nvmeSubmitIO(task *perfTask, offsetInIos int64) int {
 	rc := C.spdk_nvme_ns_cmd_write(task.context.namespace.namespace, task.context.queuePair,
 		task.ioVector.iov_base, C.ulong(lba),
 		task.context.namespace.ioSizeBlocks,
-		C.spdk_nvme_cmd_cb(C.io_complete_callback), nil,
+		C.spdk_nvme_cmd_cb(C.io_complete_callback), unsafe.Pointer(&task.id),
 		task.context.namespace.ioFlags)
 	return int(rc)
 }
@@ -334,7 +345,7 @@ func submitTask(task *perfTask) {
 var tasks []*perfTask
 
 func submitIO() {
-	for i := queueDepth; i > 0; i-- {
+	for i := queueDepth - 1; i >= 0; i-- {
 		task := allocateTask(int(i))
 		tasks = append(tasks, &task)
 		submitTask(&task)
@@ -436,6 +447,17 @@ func main() {
 }
 
 func printStats() {
-	fmt.Println("total IOs:", associateContext.ioCompleted,
+	fmt.Println("Total IOs:", associateContext.ioCompleted,
 		"IOPS:", float64(associateContext.ioCompleted)/float64(g_time_in_sec))
+	var minLatency, maxLatency uint64
+	minLatency = math.MaxUint64
+	for _, task := range tasks {
+		if uint64(task.minTsc) < minLatency {
+			minLatency = uint64(task.minTsc)
+		}
+		if uint64(task.maxTsc) > maxLatency {
+			maxLatency = uint64(task.maxTsc)
+		}
+	}
+	fmt.Println("Min latency(ns):", minLatency, "max latency(ns):", maxLatency)
 }

@@ -29,10 +29,11 @@ void attach_callback(void *cb_ctx,
 void io_complete_callback(void *cb_ctx,
 	const struct spdk_nvme_cpl *complete) {
 
-	void ioCompleteCallback(void*,
+    int *task_id = cb_ctx;
+	void ioCompleteCallback(int,
 		const struct spdk_nvme_cpl*);
 
-    ioCompleteCallback(cb_ctx, complete);
+    ioCompleteCallback(*task_id, complete);
 }
 */
 import "C"
