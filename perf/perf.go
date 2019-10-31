@@ -17,20 +17,26 @@ void attach_callback(void *cb_ctx,
 	const struct spdk_nvme_transport_id *trid,
 	struct spdk_nvme_ctrlr *ctrlr,
 	const struct spdk_nvme_ctrlr_opts *opts);
+void io_complete_callback(void *cb_ctx,
+	const struct spdk_nvme_cpl *complete);
 
 bool get_pi_loc(struct spdk_nvme_ns *ns);
+void memory_set(void *s, int c, size_t n);
+bool complete_is_error(struct spdk_nvme_cpl *cpl);
 */
 import "C"
 
 import (
 	"fmt"
 	"math"
+	"math/rand"
 	"os"
 	"unsafe"
 )
 
 const ioSizeBytes = 4096
 const queueDepth = 128
+const ioAlign = 0x200
 
 var maxMetadataIoSize C.uint32_t = 0
 var maxIoSizeBlocks C.uint32_t = 0
@@ -213,9 +219,12 @@ func registerConterollers() int {
 }
 
 type namespaceWorkerContext struct {
-	worker    *workerThread
-	namespace *namespaceEntry
-	queuePair *C.struct_spdk_nvme_qpair
+	worker            *workerThread
+	namespace         *namespaceEntry
+	queuePair         *C.struct_spdk_nvme_qpair
+	currentQueueDepth int
+	ioCompleted       int64
+	isDraining        bool
 }
 
 // we only support one core - namespace association
@@ -261,6 +270,77 @@ func nvmeInitNamespaceWorkerContext() int {
 	return 0
 }
 
+type perfTask struct {
+	ioVector  C.struct_iovec
+	submitTsc C.uint64_t
+	isRead    bool
+	context   *namespaceWorkerContext
+}
+
+func allocateTask(payloadPattern int) perfTask {
+	task := perfTask{
+		context: &associateContext,
+	}
+	task.ioVector.iov_base = C.spdk_dma_zmalloc(ioSizeBytes, ioAlign, nil)
+	if task.ioVector.iov_base == nil {
+		fmt.Println("task.ioVector.iov_base spdk_dma_zmalloc failed")
+		os.Exit(1)
+	}
+	task.ioVector.iov_len = ioSizeBytes
+	pattern := payloadPattern%8 + 1
+	C.memory_set(task.ioVector.iov_base, C.int(pattern), ioSizeBytes)
+	return task
+}
+
+//export ioCompleteCallback
+func ioCompleteCallback(callbackContext unsafe.Pointer,
+	complete *C.struct_spdk_nvme_cpl) {
+
+	if C.complete_is_error(complete) {
+		fmt.Println("IO error")
+	}
+
+	associateContext.currentQueueDepth -= 1
+	associateContext.ioCompleted += 1
+	if associateContext.isDraining {
+		return
+	}
+	task := tasks[rand.Int()%len(tasks)]
+	submitTask(task)
+}
+
+func nvmeSubmitIO(task *perfTask, offsetInIos int64) int {
+	var lba uint64 = uint64(offsetInIos * int64(task.context.namespace.ioSizeBlocks))
+	rc := C.spdk_nvme_ns_cmd_write(task.context.namespace.namespace, task.context.queuePair,
+		task.ioVector.iov_base, C.ulong(lba),
+		task.context.namespace.ioSizeBlocks,
+		C.spdk_nvme_cmd_cb(C.io_complete_callback), nil,
+		task.context.namespace.ioFlags)
+	return int(rc)
+}
+
+func submitTask(task *perfTask) {
+	offset := rand.Int63() % int64(task.context.namespace.sizeInIos)
+	task.submitTsc = C.spdk_get_ticks()
+	task.isRead = false
+	rc := nvmeSubmitIO(task, offset)
+	if rc != 0 {
+		fmt.Println("starting I/O failed")
+	} else {
+		task.context.currentQueueDepth += 1
+	}
+}
+
+var tasks []*perfTask
+
+func submitIO() {
+	for i := queueDepth; i > 0; i-- {
+		task := allocateTask(int(i))
+		tasks = append(tasks, &task)
+		submitTask(&task)
+	}
+}
+
 func workerFunction(worker *workerThread) int {
 	fmt.Println("Starting thread on core", worker.lcore)
 	v := nvmeInitNamespaceWorkerContext()
@@ -268,8 +348,36 @@ func workerFunction(worker *workerThread) int {
 		fmt.Println("ERROR: init_ns_worker_ctx() failed")
 		return 1
 	}
+
+	tsc_end := C.spdk_get_ticks() + C.uint64_t(g_time_in_sec)*g_tsc_rate
+
+	submitIO()
+
+	for {
+		rc := C.spdk_nvme_qpair_process_completions(associateContext.queuePair, 0)
+		if rc < 0 {
+			fmt.Println("NVMe io qpair process completion error")
+			os.Exit(1)
+		}
+		if C.spdk_get_ticks() > tsc_end {
+			break
+		}
+	}
+
+	// draining remaining tasks
+	associateContext.isDraining = true
+	for associateContext.currentQueueDepth > 0 {
+		rc := C.spdk_nvme_qpair_process_completions(associateContext.queuePair, 0)
+		if rc < 0 {
+			fmt.Println("NVMe io qpair process completion error")
+			os.Exit(1)
+		}
+	}
 	return 0
 }
+
+var g_tsc_rate C.uint64_t
+var g_time_in_sec C.int = 300
 
 func main() {
 	opts := C.struct_spdk_env_opts{}
@@ -283,7 +391,7 @@ func main() {
 		return
 	}
 
-	// g_tsc_rate := C.spdk_get_ticks_hz()
+	g_tsc_rate = C.spdk_get_ticks_hz()
 
 	registerWorkers()
 
@@ -291,7 +399,10 @@ func main() {
 
 	fmt.Println("workers:", workers)
 	fmt.Println("controllers:", controllers)
-	fmt.Println("namespaces:", namespaces)
+	fmt.Println("namespaces:")
+	for name, space := range namespaces {
+		fmt.Printf("%s %+v", name, space)
+	}
 
 	if len(namespaces) == 0 {
 		fmt.Println("No valid NVMe controllers found")
@@ -325,5 +436,6 @@ func main() {
 }
 
 func printStats() {
-
+	fmt.Println("total IOs:", associateContext.ioCompleted,
+		"IOPS:", float64(associateContext.ioCompleted)/float64(g_time_in_sec))
 }

@@ -25,5 +25,14 @@ void attach_callback(void *cb_ctx,
 		const struct spdk_nvme_ctrlr_opts*);
     attachCallback(cb_ctx, trid, ctrlr, opts);
 }
+
+void io_complete_callback(void *cb_ctx,
+	const struct spdk_nvme_cpl *complete) {
+
+	void ioCompleteCallback(void*,
+		const struct spdk_nvme_cpl*);
+
+    ioCompleteCallback(cb_ctx, complete);
+}
 */
 import "C"
